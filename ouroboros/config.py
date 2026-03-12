@@ -7,13 +7,40 @@ Does not import anything from ouroboros.* (zero dependency level).
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import pathlib
 import sys
 import time
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Platform-specific file locking
+# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    import msvcrt as _msvcrt
+
+    def _flock_ex(f) -> None:
+        """Acquire exclusive non-blocking lock (Windows)."""
+        _msvcrt.locking(f.fileno(), _msvcrt.LK_NBLCK, 1)
+
+    def _flock_un(f) -> None:
+        """Release lock (Windows)."""
+        try:
+            _msvcrt.locking(f.fileno(), _msvcrt.LK_UNLCK, 1)
+        except Exception:
+            pass
+else:
+    import fcntl as _fcntl
+
+    def _flock_ex(f) -> None:
+        """Acquire exclusive non-blocking lock (Unix)."""
+        _fcntl.flock(f, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+
+    def _flock_un(f) -> None:
+        """Release lock (Unix)."""
+        _fcntl.flock(f, _fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -39,10 +66,10 @@ SETTINGS_DEFAULTS = {
     "OPENROUTER_API_KEY": "",
     "OPENAI_API_KEY": "",
     "ANTHROPIC_API_KEY": "",
-    "OUROBOROS_MODEL": "anthropic/claude-sonnet-4.6",
-    "OUROBOROS_MODEL_CODE": "anthropic/claude-sonnet-4.6",
-    "OUROBOROS_MODEL_LIGHT": "google/gemini-3-flash-preview",
-    "OUROBOROS_MODEL_FALLBACK": "google/gemini-3-flash-preview",
+    "OUROBOROS_MODEL": "anthropic/claude-sonnet-4-5",
+    "OUROBOROS_MODEL_CODE": "anthropic/claude-sonnet-4-5",
+    "OUROBOROS_MODEL_LIGHT": "google/gemini-flash-1.5",
+    "OUROBOROS_MODEL_FALLBACK": "google/gemini-flash-1.5",
     "CLAUDE_CODE_MODEL": "sonnet",
     "OUROBOROS_MAX_WORKERS": 5,
     "TOTAL_BUDGET": 10.0,
@@ -53,7 +80,7 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_BG_WAKEUP_MIN": 30,
     "OUROBOROS_BG_WAKEUP_MAX": 7200,
     "OUROBOROS_EVO_COST_THRESHOLD": 0.10,
-    "OUROBOROS_WEBSEARCH_MODEL": "gpt-5.2",
+    "OUROBOROS_WEBSEARCH_MODEL": "gpt-4o-mini",
     "GITHUB_TOKEN": "",
     "GITHUB_REPO": "",
     # Local model (llama-cpp-python server)
@@ -85,7 +112,7 @@ def read_version() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Settings file locking
+# Settings file locking (cross-platform, file-existence-based)
 # ---------------------------------------------------------------------------
 _SETTINGS_LOCK = pathlib.Path(str(SETTINGS_PATH) + ".lock")
 
@@ -175,9 +202,7 @@ def apply_settings_to_env(settings: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# PID lock (single instance) — uses fcntl.flock for crash-proof locking.
-# The OS releases flock automatically when the process dies (even SIGKILL),
-# so stale lock files can never block future launches.
+# PID lock (single instance) — cross-platform
 # ---------------------------------------------------------------------------
 _lock_fd = None
 
@@ -187,7 +212,7 @@ def acquire_pid_lock() -> bool:
     APP_ROOT.mkdir(parents=True, exist_ok=True)
     try:
         _lock_fd = open(str(PID_FILE), "w")
-        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _flock_ex(_lock_fd)
         _lock_fd.write(str(os.getpid()))
         _lock_fd.flush()
         return True
@@ -199,7 +224,7 @@ def release_pid_lock() -> None:
     global _lock_fd
     if _lock_fd is not None:
         try:
-            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            _flock_un(_lock_fd)
             _lock_fd.close()
         except Exception:
             pass
