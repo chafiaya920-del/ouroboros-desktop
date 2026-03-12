@@ -47,8 +47,12 @@ _SPAWN_GRACE_SEC: float = 90.0  # workers need up to ~60s to init (spawn + pip)
 # "spawn" re-imports __main__ in child processes, which in PyInstaller frozen apps
 # causes fork bombs (each child re-runs the full app). Use "fork" by default on
 # Linux and macOS. Workers don't touch GUI, so fork is safe.
-_DEFAULT_WORKER_START_METHOD = "fork"
+# Windows does not support "fork" — use "spawn" instead.
+import sys as _sys
+_DEFAULT_WORKER_START_METHOD = "spawn" if _sys.platform == "win32" else "fork"
 _WORKER_START_METHOD = str(os.environ.get("OUROBOROS_WORKER_START_METHOD", _DEFAULT_WORKER_START_METHOD) or _DEFAULT_WORKER_START_METHOD).strip().lower()
+if _sys.platform == "win32" and _WORKER_START_METHOD == "fork":
+    _WORKER_START_METHOD = "spawn"
 if _WORKER_START_METHOD not in {"fork", "spawn", "forkserver"}:
     _WORKER_START_METHOD = _DEFAULT_WORKER_START_METHOD
 
@@ -160,15 +164,12 @@ def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple
             "_is_direct_chat": True,
         }
         if image_data:
-            # image_data is (base64, mime) or (base64, mime, caption)
             task["image_base64"] = image_data[0]
             task["image_mime"] = image_data[1]
             if len(image_data) > 2 and image_data[2]:
                 task["image_caption"] = image_data[2]
-                # Prefer caption as task text if text is empty
                 if not text:
                     task["text"] = image_data[2]
-        # Fallback for truly empty messages
         if not task["text"]:
             task["text"] = "(image attached)" if image_data else ""
         events = agent.handle_task(task)
@@ -198,14 +199,7 @@ def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple
 # ---------------------------------------------------------------------------
 
 def auto_resume_after_restart() -> None:
-    """If recent restart left open work, auto-resume without waiting for owner message.
-
-    Checks: scratchpad content, recent restart events, pending_restart_verify.
-    Background consciousness will subsume this eventually, but auto-resume is
-    needed immediately after a restart so the agent doesn't go silent.
-    """
     try:
-        # Panic flag: skip auto-resume after emergency stop (consumed on check)
         panic_flag = DRIVE_ROOT / "state" / "panic_stop.flag"
         if panic_flag.exists():
             panic_flag.unlink(missing_ok=True)
@@ -217,13 +211,11 @@ def auto_resume_after_restart() -> None:
         if not chat_id:
             return
 
-        # Check for recent restart (within 2 minutes)
         restart_verify_path = DRIVE_ROOT / "state" / "pending_restart_verify.json"
         recent_restart = False
         if restart_verify_path.exists():
             recent_restart = True
         else:
-            # Check supervisor.jsonl for recent restart event
             sup_log = DRIVE_ROOT / "logs" / "supervisor.jsonl"
             if sup_log.exists():
                 try:
@@ -241,27 +233,22 @@ def auto_resume_after_restart() -> None:
         if not recent_restart:
             return
 
-        # Check if scratchpad has meaningful content
         scratchpad_path = DRIVE_ROOT / "memory" / "scratchpad.md"
         if not scratchpad_path.exists():
             return
 
         scratchpad = scratchpad_path.read_text(encoding="utf-8")
-        # Skip if scratchpad is empty or default
         stripped = scratchpad.strip()
         if not stripped or stripped == "# Scratchpad" or "(empty" in stripped.lower():
-            # Check if it's just the default template with all empty sections
             content_lines = [
                 ln.strip() for ln in stripped.splitlines()
                 if ln.strip() and not ln.strip().startswith("#") and ln.strip() != "- (empty)"
             ]
-            # Filter out UpdatedAt lines
             content_lines = [ln for ln in content_lines if not ln.startswith("UpdatedAt:")]
             if not content_lines:
                 return
 
-        # Auto-resume: inject synthetic message
-        time.sleep(2)  # Let everything initialize
+        time.sleep(2)
         agent = _get_chat_agent()
         if not agent._busy:
             import threading
@@ -319,7 +306,6 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str)
 
 
 def _write_failure_result(task_id: str) -> None:
-    """Write a failure result file for a crashed/orphaned task (zombie prevention)."""
     if not task_id:
         return
     try:
@@ -327,7 +313,7 @@ def _write_failure_result(task_id: str) -> None:
         results_dir.mkdir(parents=True, exist_ok=True)
         final_path = results_dir / f"{task_id}.json"
         if final_path.exists():
-            return  # Don't overwrite — may be a successful completion from just before the crash
+            return
         result = {
             "task_id": task_id,
             "status": "failed",
@@ -344,7 +330,6 @@ def _write_failure_result(task_id: str) -> None:
 
 
 def _log_worker_crash(wid: int, drive_root: pathlib.Path, phase: str, exc: Exception, tb: str) -> None:
-    """Best-effort: write crash info to supervisor.jsonl from inside worker process."""
     import os as _os
     try:
         path = drive_root / "logs" / "supervisor.jsonl"
@@ -365,7 +350,6 @@ def _log_worker_crash(wid: int, drive_root: pathlib.Path, phase: str, exc: Excep
 
 
 def _first_worker_boot_event_since(offset_bytes: int) -> Optional[Dict[str, Any]]:
-    """Read first worker_boot event written after the given file offset."""
     path = DRIVE_ROOT / "logs" / "events.jsonl"
     if not path.exists():
         return None
@@ -395,7 +379,6 @@ def _first_worker_boot_event_since(offset_bytes: int) -> Optional[Dict[str, Any]
 
 
 def _verify_worker_sha_after_spawn(events_offset: int, timeout_sec: float = 90.0) -> None:
-    """Verify that newly spawned workers booted with expected current_sha."""
     st = load_state()
     expected_sha = str(st.get("current_sha") or "").strip()
     if not expected_sha:
@@ -450,7 +433,6 @@ def _verify_worker_sha_after_spawn(events_offset: int, timeout_sec: float = 90.0
 
 def spawn_workers(n: int = 0) -> None:
     global _CTX, _EVENT_Q
-    # Force fresh context to ensure workers use latest code
     _CTX = mp.get_context(_WORKER_START_METHOD)
     _EVENT_Q = _CTX.Queue()
     events_path = DRIVE_ROOT / "logs" / "events.jsonl"
@@ -479,7 +461,6 @@ def spawn_workers(n: int = 0) -> None:
         WORKERS[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None)
     global _LAST_SPAWN_TIME
     _LAST_SPAWN_TIME = time.time()
-    # Run SHA verification in background to avoid blocking the main loop for up to 90s
     threading.Thread(target=_verify_worker_sha_after_spawn, args=(events_offset,), daemon=True).start()
 
 
@@ -495,7 +476,6 @@ def kill_workers(force: bool = False) -> None:
         if force:
             _kill_survivors()
         WORKERS.clear()
-        # --- Zombie prevention: write failure results before clearing ---
         try:
             orphaned_ids = []
             for task_id in list(RUNNING):
@@ -540,7 +520,6 @@ def kill_workers(force: bool = False) -> None:
 
 
 def _kill_survivors() -> None:
-    """SIGKILL any workers still alive after SIGTERM."""
     import signal
     for w in WORKERS.values():
         if not w.proc.is_alive():
@@ -564,7 +543,6 @@ def respawn_worker(wid: int) -> None:
     proc.daemon = True
     proc.start()
     WORKERS[wid] = Worker(wid=wid, proc=proc, in_q=in_q, busy_task_id=None)
-    # Give freshly respawned workers the same init grace as startup workers.
     _LAST_SPAWN_TIME = time.time()
 
 
@@ -576,11 +554,10 @@ def assign_tasks() -> None:
         remaining = budget_remaining(st)
         
         if remaining <= 0:
-            return  # Stop assigning ALL tasks if budget is completely exhausted
+            return
             
         for w in WORKERS.values():
             if w.busy_task_id is None and PENDING:
-                # Find first suitable task (skip over-budget evolution tasks)
                 chosen_idx = None
                 for i, candidate in enumerate(PENDING):
                     if str(candidate.get("type") or "") == "evolution" and remaining < EVOLUTION_BUDGET_RESERVE:
@@ -588,7 +565,6 @@ def assign_tasks() -> None:
                     chosen_idx = i
                     break
                 if chosen_idx is None:
-                    # Only over-budget evolution tasks remain — clean them out
                     PENDING[:] = [t for t in PENDING if str(t.get("type") or "") != "evolution"]
                     queue.persist_queue_snapshot(reason="evolution_dropped_budget")
                     continue
@@ -619,7 +595,6 @@ def assign_tasks() -> None:
 
 def ensure_workers_healthy() -> None:
     from supervisor import queue
-    # Grace period: skip health check right after spawn — workers need time to initialize
     if (time.time() - _LAST_SPAWN_TIME) < _SPAWN_GRACE_SEC:
         return
     busy_crashes = 0
@@ -673,20 +648,13 @@ def ensure_workers_healthy() -> None:
     now = time.time()
     alive_now = sum(1 for w in WORKERS.values() if w.proc.is_alive())
     if dead_detections:
-        # Count only meaningful failures:
-        # - any crash while a task was running, or
-        # - all workers dead at once.
         if busy_crashes > 0 or alive_now == 0:
             CRASH_TS.extend([now] * max(1, dead_detections))
         else:
-            # Idle worker deaths with at least one healthy worker are degraded mode,
-            # not a crash storm condition.
             CRASH_TS.clear()
 
     CRASH_TS[:] = [t for t in CRASH_TS if (now - t) < 60.0]
     if len(CRASH_TS) >= 3:
-        # Log crash storm but DON'T execv restart — that creates infinite loops.
-        # Instead: kill dead workers, notify owner, continue with direct-chat (threading).
         st = load_state()
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -704,8 +672,5 @@ def ensure_workers_healthy() -> None:
                 "⚠️ Frequent worker crashes. Multiprocessing workers disabled, "
                 "continuing in direct-chat mode (threading).",
             )
-        # Kill all workers — direct chat via handle_chat_direct still works
         kill_workers()
         CRASH_TS.clear()
-
-
